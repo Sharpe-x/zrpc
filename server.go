@@ -3,12 +3,14 @@ package zrpc
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"reflect"
 	"strings"
 	"sync"
+	"time"
 	"zrpc/codec"
 )
 
@@ -25,11 +27,17 @@ const MagicNumber = 0x3bef5c
 type Option struct {
 	MagicNumber int        // MagicNumber marks  a zrpc request
 	CodecType   codec.Type // client may choose different Codec to encode body
+	// 超时处理是 RPC 框架一个比较基本的能力，如果缺少超时处理机制，无论是服务端还是客户端都容易因为网络或其他错误导致挂死，资源耗尽，这些问题的出现大大地降低了服务的可用性。因此，我们需要在 RPC 框架中加入超时处理的能力。
+	// 需要客户端处理超时的地方有 与服务端建立连接，导致的超时 发送请求到服务端，写报文导致的超时 等待服务端处理时，等待处理导致的超时（比如服务端已挂死，迟迟不响应） 从服务端接收响应时，读报文导致的超时
+	// 需要服务端处理超时的地方有 读取客户端请求报文时，读报文导致的超时 发送响应报文时，写报文导致的超时 调用映射服务的方法时，处理报文导致的超时
+	ConnectTimeout time.Duration //
+	HandleTimeout  time.Duration //
 }
 
 var DefaultOption = &Option{
-	MagicNumber: MagicNumber,
-	CodecType:   codec.GobType,
+	MagicNumber:    MagicNumber,
+	CodecType:      codec.GobType,
+	ConnectTimeout: time.Second * 10,
 }
 
 /*
@@ -140,17 +148,17 @@ func (s *Server) ServeConn(conn io.ReadWriteCloser) {
 	}
 
 	//然后根据 CodeType 得到对应的消息编解码器，接下来的处理交给 serverCodec。
-	s.serveCodec(f(conn))
+	s.serveCodec(f(conn), &opt)
 }
 
-func (s *Server) serveCodec(cc codec.Codec) {
+func (s *Server) serveCodec(cc codec.Codec, opt *Option) {
 	sending := new(sync.Mutex)
 	wg := new(sync.WaitGroup)
 
 	for { // 在一次连接中，允许接收多个请求，即多个 request header 和 request body，因此这里使用了 for 无限制地等待请求的到来
 		req, err := s.readRequest(cc) // 读取请求 readRequest
 		if err != nil {
-			if req != nil {
+			if req == nil {
 				break // it's not possible to recover, so close the connection
 			}
 			// 尽力而为，只有在 header 解析失败时，才终止循环。
@@ -161,7 +169,7 @@ func (s *Server) serveCodec(cc codec.Codec) {
 		wg.Add(1)
 		// 处理请求是并发的，但是回复请求的报文必须是逐个发送的，并发容易导致多个回复报文交织在一起，
 		// 客户端无法解析。在这里使用锁(sending)保证。
-		go s.handleRequest(cc, req, sending, wg) // 处理请求 handleRequest
+		go s.handleRequest(cc, req, sending, wg, opt.HandleTimeout) // 处理请求 handleRequest
 	}
 
 	wg.Wait()
@@ -210,15 +218,38 @@ func (s *Server) readRequest(cc codec.Codec) (*request, error) {
 	return req, nil
 }
 
-func (s *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
+func (s *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
 	defer wg.Done()
-	err := req.svc.call(req.mtype, req.argv, req.replyv)
-	if err != nil {
-		req.h.Error = err.Error()
-		s.sendResponse(cc, req.h, "invalidRequest", sending)
+	called := make(chan struct{})
+	sent := make(chan struct{})
+	go func() {
+		err := req.svc.call(req.mtype, req.argv, req.replyv)
+		called <- struct{}{}
+
+		if err != nil {
+			req.h.Error = err.Error()
+			s.sendResponse(cc, req.h, "invalidRequest", sending)
+			sent <- struct{}{}
+			return
+		}
+
+		s.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+		sent <- struct{}{}
+	}()
+
+	if timeout == 0 {
+		<-called
+		<-sent
 		return
 	}
-	s.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+
+	select {
+	case <-time.After(timeout):
+		req.h.Error = fmt.Sprintf("rpc server: request handle timeout: expect within %s", timeout)
+		s.sendResponse(cc, req.h, "invalidRequest", sending)
+	case <-called:
+		<-sent
+	}
 }
 
 func (s *Server) sendResponse(cc codec.Codec, h *codec.Header, body interface{}, sending *sync.Mutex) {

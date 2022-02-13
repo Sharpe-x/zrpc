@@ -1,6 +1,7 @@
 package zrpc
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 	"zrpc/codec"
 )
 
@@ -139,6 +141,53 @@ func (c *Client) receive() {
 	c.terminateCalls(err)
 }
 
+type clientResult struct {
+	client *Client
+	err    error
+}
+
+type newClientFunc func(conn net.Conn, opt *Option) (client *Client, err error)
+
+func dialTimeout(f newClientFunc, network, address string, opts ...*Option) (client *Client, err error) {
+	opt, err := parseOptions(opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	conn, err := net.DialTimeout(network, address, opt.ConnectTimeout)
+	if err != nil {
+		return nil, err
+	}
+
+	defer func() {
+		if err != nil {
+			_ = conn.Close()
+		}
+	}()
+
+	ch := make(chan clientResult)
+	go func() {
+		client, err = f(conn, opt)
+		ch <- clientResult{
+			client: client,
+			err:    err,
+		}
+	}()
+
+	if opt.ConnectTimeout == 0 {
+		result := <-ch
+		return result.client, result.err
+	}
+
+	select {
+	case <-time.After(opt.ConnectTimeout):
+		return nil, fmt.Errorf("rpc client: connect timeout: expect within %s", opt.ConnectTimeout)
+	case result := <-ch:
+		return result.client, result.err
+	}
+
+}
+
 // NewClient 实例时，首先需要完成一开始的协议交换，即发送 Option 信息给服务端。协商好消息的编解码方式之后，再创建一个子协程调用 receive() 接收响应。
 func NewClient(conn net.Conn, opt *Option) (*Client, error) {
 	f := codec.NewCodeFuncMap[opt.CodecType]
@@ -151,7 +200,7 @@ func NewClient(conn net.Conn, opt *Option) (*Client, error) {
 	// send options with server
 	if err := json.NewEncoder(conn).Encode(opt); err != nil {
 		log.Println("rpc client: options error:", err)
-		_ = conn.Close()
+		//_ = conn.Close()
 		return nil, err
 	}
 
@@ -185,12 +234,16 @@ func parseOptions(opts ...*Option) (*Option, error) {
 	if opt.CodecType == "" {
 		opt.CodecType = DefaultOption.CodecType
 	}
+	if opt.ConnectTimeout == 0 {
+		opt.ConnectTimeout = DefaultOption.ConnectTimeout
+	}
+
 	return opt, nil
 }
 
 //Dial 函数，便于用户传入服务端地址，创建 Client 实例。为了简化用户调用，通过 ...*Option 将 Option 实现为可选参数。
 func Dial(network, address string, opts ...*Option) (client *Client, err error) {
-	opt, err := parseOptions(opts...)
+	/*opt, err := parseOptions(opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -205,7 +258,8 @@ func Dial(network, address string, opts ...*Option) (client *Client, err error) 
 		}
 	}()
 
-	return NewClient(conn, opt)
+	return NewClient(conn, opt)*/
+	return dialTimeout(NewClient, network, address, opts...)
 }
 
 func (c *Client) send(call *Call) {
@@ -258,7 +312,13 @@ func (c *Client) Go(serviceMethod string, args, reply interface{}, done chan *Ca
 
 // Call invokes the named function, waits for it to complete,
 // and returns its error status.
-func (c *Client) Call(serviceMethod string, args, reply interface{}) error {
-	call := <-c.Go(serviceMethod, args, reply, make(chan *Call, 1)).Done
-	return call.Error
+func (c *Client) Call(ctx context.Context, serviceMethod string, args, reply interface{}) error {
+	call := c.Go(serviceMethod, args, reply, make(chan *Call, 1))
+	select {
+	case <-ctx.Done():
+		c.removeCall(call.Seq)
+		return errors.New("rpc client: call failed: " + ctx.Err().Error())
+	case ca := <-call.Done:
+		return ca.Error
+	}
 }
