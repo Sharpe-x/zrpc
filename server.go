@@ -2,11 +2,12 @@ package zrpc
 
 import (
 	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
 	"log"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 	"zrpc/codec"
 )
@@ -44,7 +45,43 @@ var DefaultOption = &Option{
 */
 
 // Server represents a rpc server
-type Server struct{}
+type Server struct {
+	serviceMap sync.Map
+}
+
+func (s *Server) Register(rcvr interface{}) error {
+	serv := newService(rcvr)
+	if _, dup := s.serviceMap.LoadOrStore(serv.name, serv); dup {
+		return errors.New("rpc: service already defined: " + serv.name)
+	}
+	return nil
+}
+
+func Register(revr interface{}) error {
+	return DefaultServer.Register(revr)
+}
+
+func (s *Server) findService(serviceMethod string) (srv *service, mtype *methodType, err error) {
+	dot := strings.LastIndex(serviceMethod, ".")
+	if dot < 0 {
+		err = errors.New("rpc server: service/method request ill-formed: " + serviceMethod)
+		return
+	}
+
+	serviceName, methodName := serviceMethod[:dot], serviceMethod[dot+1:]
+	serv, ok := s.serviceMap.Load(serviceName)
+	if !ok {
+		err = errors.New("rpc server: can't find service " + serviceName)
+		return
+	}
+
+	srv = serv.(*service)
+	mtype = srv.method[methodName]
+	if mtype == nil {
+		err = errors.New("rpc server: can't find method " + methodName)
+	}
+	return
+}
 
 // NewServer creates a new rpc server
 func NewServer() *Server {
@@ -154,9 +191,20 @@ func (s *Server) readRequest(cc codec.Codec) (*request, error) {
 		h: h,
 	}
 
-	// TODO: now we don't know the type of request argv
-	req.argv = reflect.New(reflect.TypeOf("i"))
-	if err = cc.ReadBody(req.argv.Interface()); err != nil {
+	req.svc, req.mtype, err = s.findService(h.ServiceMethod)
+	if err != nil {
+		return req, err
+	}
+
+	req.argv = req.mtype.newArgv()
+	req.replyv = req.mtype.newReplyv()
+
+	argvi := req.argv.Interface()
+	if req.argv.Type().Kind() != reflect.Ptr {
+		argvi = req.argv.Addr().Interface()
+	}
+
+	if err = cc.ReadBody(argvi); err != nil {
 		log.Println("rpc server: read argv err: ", err)
 	}
 	return req, nil
@@ -164,9 +212,12 @@ func (s *Server) readRequest(cc codec.Codec) (*request, error) {
 
 func (s *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
 	defer wg.Done()
-	// TODO, should call registered rpc methods to get the right replyv
-	log.Println(req.h, req.argv.Elem())
-	req.replyv = reflect.ValueOf(fmt.Sprintf("zrpc resp %d", req.h.Seq))
+	err := req.svc.call(req.mtype, req.argv, req.replyv)
+	if err != nil {
+		req.h.Error = err.Error()
+		s.sendResponse(cc, req.h, "invalidRequest", sending)
+		return
+	}
 	s.sendResponse(cc, req.h, req.replyv.Interface(), sending)
 }
 
@@ -182,4 +233,6 @@ func (s *Server) sendResponse(cc codec.Codec, h *codec.Header, body interface{},
 type request struct {
 	h            *codec.Header
 	argv, replyv reflect.Value
+	mtype        *methodType
+	svc          *service
 }
