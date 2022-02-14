@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
@@ -267,3 +268,72 @@ type request struct {
 	mtype        *methodType
 	svc          *service
 }
+
+// Web 开发中，我们经常使用 HTTP 协议中的 HEAD、GET、POST 等方式发送请求，等待响应。
+// 但 RPC 的消息格式与标准的 HTTP 协议并不兼容，在这种情况下，就需要一个协议的转换过程。
+// HTTP 协议的 CONNECT 方法恰好提供了这个能力，CONNECT 一般用于代理服务。
+// 假设浏览器与服务器之间的 HTTPS 通信都是加密的，浏览器通过代理服务器发起 HTTPS 请求时，
+// 由于请求的站点地址和端口号都是加密保存在 HTTPS 请求报文头中的，代理服务器如何知道往哪里发送请求呢？
+//为了解决这个问题，浏览器通过 HTTP 明文形式向代理服务器发送一个 CONNECT
+//请求告诉代理服务器目标地址和端口，代理服务器接收到这个请求后，会在对应端口与目标站点建立一个 TCP 连接，
+//连接建立成功后返回 HTTP 200 状态码告诉浏览器与该站点的加密通道已经完成。接下来代理服务器仅需透传浏览器和服务器之间的加密数据包即可，代理服务器无需解析 HTTPS 报文。
+// example
+//  浏览器向代理服务器发送 CONNECT 请求。 CONNECT test.com:443 HTTP/1.0
+// 代理服务器返回 HTTP 200 状态码表示连接已经建立。 HTTP/1.0 200 Connection Established
+// 之后浏览器和服务器开始 HTTPS 握手并交换加密数据，代理服务器只负责传输彼此的数据包，并不能读取具体数据内容（代理服务器也可以选择安装可信根证书解密 HTTPS 报文）。
+// 这个过程其实是通过代理服务器将 HTTP 协议转换为 HTTPS 协议的过程。对 RPC 服务端来，需要做的是将 HTTP 协议转换为 RPC 协议，对客户端来说，需要新增通过 HTTP CONNECT 请求创建连接的逻辑。
+// 服务端支持 HTTP 协议
+// 客户端向 RPC 服务器发送 CONNECT 请求 CONNECT 10.0.0.1:9999/_zrpc_ HTTP/1.0
+// RPC 服务器返回 HTTP 200 状态码表示连接建立。
+// HTTP/1.0 200 Connected to ZRPC
+// 客户端使用创建好的连接发送 RPC 报文，先发送 Option，再发送 N 个请求报文，服务端处理 RPC 请求并响应。
+
+const (
+	connected           = "200 Connected to ZRPC"
+	defaultRPCPath      = "/_zrpc_"
+	defaultDebugRPCPath = "/debug/_zrpc_" //DEBUG 页面地址。
+
+)
+
+// ServeHTTP implements an http.Handler that answers RPC requests.
+func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if req.Method != "CONNECT" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = io.WriteString(w, "405 must CONNECT\n")
+		return
+	}
+
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		log.Print("rpc hijacking", req.RemoteAddr, ": ", err.Error())
+		return
+	}
+	_, _ = io.WriteString(conn, "HTTP/1.0 "+connected+"\n\n")
+	s.ServeConn(conn)
+}
+
+// HandleHTTP registers an HTTP handler for RPC messages on rpcPath.
+// It is still necessary to invoke http.Serve(), typically in a go statement.
+func (s *Server) HandleHTTP() {
+	http.Handle(defaultRPCPath, s)
+	http.Handle(defaultDebugRPCPath, debugHTTP{s})
+	log.Println("rpc server debug path:", defaultDebugRPCPath)
+}
+
+// HandleHTTP is a convenient approach for default server to register HTTP handlers
+func HandleHTTP() {
+	DefaultServer.HandleHTTP()
+}
+
+// 在 Go 语言中处理 HTTP 请求是非常简单的一件事，Go 标准库中 http.Handle 的实现如下：
+// package http
+//// Handle registers the handler for the given pattern
+//// in the DefaultServeMux.
+//// The documentation for ServeMux explains how patterns are matched.
+//func Handle(pattern string, handler Handler) { DefaultServeMux.Handle(pattern, handler) }
+// 第一个参数是支持通配的字符串 pattern，在这里，我们固定传入 /-_zrpc_，第二个参数是 Handler 类型，Handler 是一个接口类型，定义如下：
+// type Handler interface {
+//    ServeHTTP(w ResponseWriter, r *Request)
+//}
+// 只需要实现接口 Handler 即可作为一个 HTTP Handler 处理 HTTP 请求。接口 Handler 只定义了一个方法 ServeHTTP，实现该方法即可。
