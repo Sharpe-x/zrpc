@@ -2,8 +2,11 @@ package xclient
 
 import (
 	"errors"
+	"log"
 	"math"
 	"math/rand"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -23,6 +26,7 @@ const (
 	RandomSelect     SelectMode = iota // 随机
 	RoundRobinSelect                   // 轮询
 )
+const defaultUpdateTimeout = time.Second * 10
 
 // Discovery 服务发现所需要的最基本的接口。
 type Discovery interface {
@@ -30,6 +34,26 @@ type Discovery interface {
 	Update(services []string) error      // 手动更新服务列表
 	Get(mode SelectMode) (string, error) // 根据负载均衡策略选择一个服务实例
 	GetAll() ([]string, error)           //返回所有的服务实例
+}
+
+// ZrpcRegistryDiscovery  嵌套了 MultiServersDiscovery，很多能力可以复用。
+type ZrpcRegistryDiscovery struct {
+	*MultiServersDiscovery
+	registry   string        // 注册中心的地址
+	timeout    time.Duration // 服务列表的过期时间
+	lastUpdate time.Time     // 最后从注册中心更新服务列表的时间，默认 10s 过期，即 10s 之后，需要从注册中心更新新的列表。
+}
+
+func NewZrpcRegistryDiscovery(registerAddr string, timeout time.Duration) *ZrpcRegistryDiscovery {
+	if timeout == 0 {
+		timeout = defaultUpdateTimeout
+	}
+	d := &ZrpcRegistryDiscovery{
+		MultiServersDiscovery: NewMultiServerDiscovery(make([]string, 0)),
+		registry:              registerAddr,
+		timeout:               timeout,
+	}
+	return d
 }
 
 // MultiServersDiscovery 服务列表手工维护 暂不需要注册中心的服务发现结构体
@@ -87,4 +111,50 @@ func (d *MultiServersDiscovery) GetAll() ([]string, error) {
 	servers := make([]string, len(d.servers), len(d.servers))
 	copy(servers, d.servers)
 	return servers, nil
+}
+
+func (d *ZrpcRegistryDiscovery) Update(servers []string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.servers = servers
+	d.lastUpdate = time.Now()
+	return nil
+}
+
+func (d *ZrpcRegistryDiscovery) Refresh() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.lastUpdate.Add(d.timeout).After(time.Now()) {
+		return nil
+	}
+
+	log.Println("rec registry: refresh servers from registry", d.registry)
+	resp, err := http.Get(d.registry)
+	if err != nil {
+		log.Println("rpc registry refresh err:", err)
+		return err
+	}
+	servers := strings.Split(resp.Header.Get("X-Zrpc-Servers"), ",")
+	d.servers = make([]string, 0, len(servers))
+	for _, server := range servers {
+		if strings.TrimSpace(server) != "" {
+			d.servers = append(d.servers, strings.TrimSpace(server))
+		}
+	}
+	d.lastUpdate = time.Now()
+	return nil
+}
+
+func (d *ZrpcRegistryDiscovery) Get(mode SelectMode) (string, error) {
+	if err := d.Refresh(); err != nil {
+		return "", err
+	}
+	return d.MultiServersDiscovery.Get(mode)
+}
+
+func (d *ZrpcRegistryDiscovery) GetAll() ([]string, error) {
+	if err := d.Refresh(); err != nil {
+		return nil, err
+	}
+	return d.MultiServersDiscovery.GetAll()
 }
